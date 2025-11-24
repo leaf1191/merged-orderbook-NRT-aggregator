@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+// C++ 네임스페이스를 지정하여 충돌을 피합니다.
+package orderbook_pb;
+
+// 가격 레벨 (Price, Quantity)
+message PriceLevel {
+  double price = 1;
+  double quantity = 2;
+}
+
+// 오더북 델타 이벤트 구조체
+message Delta {
+  // 문자열 필드 (파티션 키에 사용됨)
+  string exchange = 1;
+  string instance = 2;
+  string symbol = 3;        // 파티션 키에 사용되는 심볼
+
+  // 큰 정수형 데이터
+  int64 seq = 4;            
+  
+  // 시간 데이터 (밀리초 정수형이 효율적입니다)
+  int64 event_ts_ms = 5;
+  double recv_ts_sec = 6;   // 로컬 수신 시각 (초)
+
+  // 반복되는 PriceLevel 리스트
+  repeated PriceLevel bids = 7;
+  repeated PriceLevel asks = 8;
+}
