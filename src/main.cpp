@@ -1,13 +1,18 @@
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <atomic>
 #include <memory>
 #include <map>
+#include <fstream>
 #include <immintrin.h>
 #include "common.hpp"
 #include "clean_data.hpp"
 #include "merged_order_book.hpp"
+#include "iring_buffer.hpp"
 #include "optimistic_ring_buffer.hpp"
+#include "mutex_ring_buffer.hpp"
+#include "spin_lock_ring_buffer.hpp"
 #include "nrt_latch.hpp"
 #include "aggregator_metrics.hpp"
 
@@ -31,7 +36,7 @@ mutex mtx_shutdown;
 void reader_thread_func(
     const string& stream_name,    // Target Stream Name
     const string& consumer_arn,   // EFO Consumer ARN
-    OptimisticRingBuffer<CleanData>& buffer, 
+    IRingBuffer<CleanData>& buffer, 
     atomic<bool>& running)
 {
     cout << "[Reader] Connecting to Stream: " << stream_name << "..." << '\n';
@@ -138,15 +143,15 @@ void reader_thread_func(
 
 void processor_thread_func(
     const string& product_name,
-    OptimisticRingBuffer<CleanData>& input_buffer,
+    IRingBuffer<CleanData>& input_buffer,
     NrtLatch<MergedOrderBook>& output_latch,
     atomic<bool>& running)
 {
     cout << "[Processor-" << product_name << "] 시작." << '\n';
 
-    const uint64_t WINDOW_SIZE_MS = 10;
-    const uint64_t WATERMARK_DELAY_MS = 50; // (튜닝 전)
-    const uint64_t MY_CAPACITY = 200;
+    const uint64_t WINDOW_SIZE_MS = 7;
+    const uint64_t WATERMARK_DELAY_MS = 1;
+    const uint64_t MY_CAPACITY = 3000;
 
     uint64_t my_last_processed_seq = input_buffer.get_write_cursor();
 
@@ -173,9 +178,14 @@ void processor_thread_func(
 
         // "건너뛰기" 로직
         const uint64_t seq_to_end = latest_available_seq;
-        uint64_t start_seq = (pending_items > MY_CAPACITY)
-                                ? (seq_to_end - MY_CAPACITY)
-                                : (my_last_processed_seq);
+        uint64_t start_seq;
+        if (pending_items > MY_CAPACITY) {
+            uint64_t jump_cnt = pending_items - MY_CAPACITY;
+            metrics.jumped_count += jump_cnt;
+            start_seq = seq_to_end - MY_CAPACITY;
+        } else {
+            start_seq = my_last_processed_seq;
+        }
 
         for (uint64_t i = start_seq; i < seq_to_end; ++i) {
             CleanData data;
@@ -191,7 +201,7 @@ void processor_thread_func(
                     break;
                 } 
                 else if (result == ReadResult::NotReady) {
-                    _mm_pause(); // L3 캐시 무효화 문제 개선
+                    _mm_pause(); // flush 비용 및 L3 캐시 읽기 요청 개선
                     if (++retry_count > MAX_RETRIES) {
                         read_success = false;
                         break;
@@ -233,6 +243,7 @@ void processor_thread_func(
 
             vector<CleanData>& events_to_process = it->second;
             set<string> updated_exchanges; // 스냅샷 완전성 체크용
+            map<string, uint64_t> current_window_max_ts; // 이번 윈도우 내 거래소별 Max TS 추적
 
             // 메모리 상태 업데이트 - 래치 효과
             for (const auto& evt : events_to_process) {
@@ -245,17 +256,25 @@ void processor_thread_func(
                     current_asks[evt.exchange].clear();
                     for (const auto& [p, s] : evt.asks) current_asks[evt.exchange][p] = s;
                 }
+                // ts 기록
+                uint64_t& ts = current_window_max_ts[evt.exchange];
+                if (evt.ts_event > ts) ts = evt.ts_event;
             }
 
             metrics.total_windows++;
             if (updated_exchanges.size() < 3) {
                 metrics.incomplete_windows++;
+                //cout<< updated_exchanges.size() << '\n';
             }
 
             // 래치에 저장할 스냅샷 생성
             auto snapshot_ptr = make_shared<MergedOrderBook>();
             snapshot_ptr->window_start_time = window_to_process;
 
+            // 윈도우 처리 로직
+            for (auto const& [ex, ts] : current_window_max_ts) {
+                snapshot_ptr->fresh_updates_ts.push_back(ts);
+            }
             for (auto const& [ex, book] : current_bids) {
                 for (auto const& [p, s] : book) snapshot_ptr->global_bids.emplace_back(p, s, ex);
             }
@@ -284,17 +303,23 @@ void processor_thread_func(
             metrics.cycle_time_hist.record(elapsed_us);
             metrics.report_counter++;
 
-            if (metrics.report_counter >= 500) {
+            if (metrics.report_counter >= 1000) {
                 cout << "\n=== [Metrics: " << product_name << "] ===" << '\n';
                 cout << " Cycle P99.9: " << metrics.cycle_time_hist.get_percentile(0.999) << " us" << '\n';
                 cout << " Skew P99   : " << (double)metrics.skew_hist.get_percentile(0.99)/1000.0 << " ms" << '\n';
-                cout << " Incomplete : " << (double)metrics.incomplete_windows/metrics.total_windows*100.0 << "%" << '\n';
+                //cout << " Incomplete : " << (double)metrics.incomplete_windows/metrics.total_windows*100.0 << "%" << '\n';
+                cout << " Jumped     : " << metrics.jumped_count << '\n';
                 metrics.reset();
             }
         }
 
     }
 }
+// csv 파일 기록용
+struct LogEntry {
+    uint64_t window_time;
+    uint64_t latency;
+};
 
 // Publisher 스레드 (I/O-Bound)
 void publisher_thread_func(
@@ -305,27 +330,104 @@ void publisher_thread_func(
     cout << "[Publisher-" << product_name << "] 시작." << '\n';
     shared_ptr<MergedOrderBook> last_processed_ptr = nullptr;
 
+    // Metric 변수
+    LatencyHistogram latency_hist(1000); // Max 1000ms
+    uint64_t published_count = 0;
+    auto last_report_time = chrono::steady_clock::now();
+    const int REPORT_INTERVAL = 1000;
+
+    vector<LogEntry> log_buffer;
+    log_buffer.reserve(REPORT_INTERVAL * 3);
+
+    string filename = "latency_log_" + product_name + ".csv";
+    ofstream csv_file(filename);
+    csv_file << "WindowStart,Latency_ms" << '\n'; 
+
     while (running) {
         auto current_ptr = input_latch.load();
 
         if (current_ptr && current_ptr != last_processed_ptr) {
-            
-            cout << "[Publisher-" << product_name << "] Window " << current_ptr->window_start_time << " 발행! (";
-            if (!current_ptr->global_bids.empty()) {
-                cout << "Best Bid: " << get<0>(current_ptr->global_bids[0]);
-            } else { cout << "Best Bid: N/A"; }
-            cout << " / ";
-            if (!current_ptr->global_asks.empty()) {
-                cout << "Best Ask: " << get<0>(current_ptr->global_asks[0]);
-            } else { cout << "Best Ask: N/A"; }
-            cout << ")" << '\n';
+            // Publisher의 I/O 병목 시뮬레이션
+            this_thread::sleep_for(chrono::milliseconds(80));
 
+            // 오더북 데이터 출력 로직
+            // cout << "[Publisher-" << product_name << "] Window " << current_ptr->window_start_time << " 발행! (";
+            // if (!current_ptr->global_bids.empty()) {
+            //     const auto& best_bid = current_ptr->global_bids[0];
+            //     cout << "Best Bid: " << get<0>(best_bid) << " (" << get<2>(best_bid) << ")";
+            // } else { cout << "Best Bid: N/A"; }
+            // cout << " / ";
+            // if (!current_ptr->global_asks.empty()) {
+            //     const auto& best_ask = current_ptr->global_asks[0];
+            //     cout << "Best Ask: " << get<0>(best_ask) << " (" << get<2>(best_ask) << ")";
+            // } else { cout << "Best Ask: N/A"; }
+            // cout << ")" << '\n';
+
+            // latency 측정
+            uint64_t now_ms = chrono::duration_cast<chrono::milliseconds>(
+                chrono::system_clock::now().time_since_epoch()
+            ).count();
+            if (!current_ptr->fresh_updates_ts.empty()) {
+                for (uint64_t event_ts : current_ptr->fresh_updates_ts) {
+                    uint64_t lat = (now_ms >= event_ts) ? (now_ms - event_ts) : 0;
+                    latency_hist.record(lat);
+                    log_buffer.push_back({current_ptr->window_start_time, lat});
+                }
+            }
+
+            published_count++;
             last_processed_ptr = current_ptr;
+
+            // 로그 출력
+            if (published_count % REPORT_INTERVAL == 0) {
+                auto now_t = chrono::steady_clock::now();
+                auto duration_ms = chrono::duration_cast<chrono::milliseconds>(now_t - last_report_time).count();
+
+                string chunk_data;
+                chunk_data.reserve(log_buffer.size() * 40);
+                // 문자열 생성
+                for (const auto& entry : log_buffer) {
+                    chunk_data += to_string(entry.window_time);
+                    chunk_data += ",";
+                    chunk_data += to_string(entry.latency);
+                    chunk_data += "\n";
+                }
+                csv_file.write(chunk_data.c_str(), chunk_data.size()); // 단한번 덤프
+                log_buffer.clear();
+
+                // TPS 계산
+                double tps = (double)REPORT_INTERVAL / (duration_ms / 1000.0);
+                
+                // Latency P99 계산
+                auto [mean, std_dev] = latency_hist.get_stats();
+                uint64_t p50 = latency_hist.get_percentile(0.50);
+                uint64_t p99 = latency_hist.get_percentile(0.99);
+                uint64_t max_lat = latency_hist.get_percentile(1.00);
+
+                cout << ">>> [Metrics-" << product_name << "]"
+                     << " TPS: " << tps 
+                     << " | Latency(ms) [Avg: " << mean 
+                     << ", P50: " << p50
+                     << ", P99: " << p99 
+                     << ", Max: " << max_lat 
+                     << ", Jitter: " << std_dev << "]" 
+                     << '\n';
+
+                // 초기화
+                last_report_time = now_t;
+                latency_hist.reset(); 
+            }
+        } else {
+            this_thread::yield(); // IO 바운드 -> 원활한 OS 스케줄링
         }
-        
-        // Publisher의 I/O 병목 시뮬레이션
-        this_thread::sleep_for(chrono::milliseconds(80));
     }
+    // 종료 시 남은 버퍼 잔량 처리
+    if (!log_buffer.empty()) {
+        for (const auto& entry : log_buffer) {
+             csv_file << entry.window_time << "," << entry.latency << "\n";
+        }
+    }
+    csv_file.close();
 }
 
 
@@ -340,18 +442,35 @@ int main() {
 
     // 스트림 이름과 EFO ARN (실제 환경 값 필요)
     string stream_btc = "BTC";
-    string arn_btc = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/orderbook-binance/consumer/MyEFOConsumer:1763804126";
+    string arn_btc = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/BTC/consumer/MyEFOConsumer:1763975228";
 
     string stream_eth = "ETH";
-    string arn_eth = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/orderbook-bybit/consumer/MyEFOConsumer:1763804193";
+    string arn_eth = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/ETH/consumer/MyEFOConsumer:1763975236";
 
     string stream_sol = "SOL";
-    string arn_sol = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/orderbook-okx/consumer/MyEFOConsumer:1763804233";
+    string arn_sol = "arn:aws:kinesis:ap-northeast-2:337909762204:stream/SOL/consumer/MyEFOConsumer:1763975245";
 
     // 3개의 NRT 링 버퍼 (Reader -> Processor)
-    OptimisticRingBuffer<CleanData> buffer_btc(65536);
-    OptimisticRingBuffer<CleanData> buffer_eth(65536);
-    OptimisticRingBuffer<CleanData> buffer_sol(65536);
+    // Case 1: Optimistic (Lock-Free)
+    // OptimisticRingBuffer<CleanData> buffer_btc_impl(65536);
+    // OptimisticRingBuffer<CleanData> buffer_eth_impl(65536);
+    // OptimisticRingBuffer<CleanData> buffer_sol_impl(65536);
+
+    // Case 2: Mutex (Blocking)
+    // MutexRingBuffer<CleanData> buffer_btc_impl(65536);
+    // MutexRingBuffer<CleanData> buffer_eth_impl(65536);
+    // MutexRingBuffer<CleanData> buffer_sol_impl(65536);
+    
+    // Case 3: Spinlock
+    SpinLockRingBuffer<CleanData> buffer_btc_impl(65536);
+    SpinLockRingBuffer<CleanData> buffer_eth_impl(65536);
+    SpinLockRingBuffer<CleanData> buffer_sol_impl(65536);
+
+
+    // 인터페이스 참조로 변환
+    IRingBuffer<CleanData>& buffer_btc = buffer_btc_impl;
+    IRingBuffer<CleanData>& buffer_eth = buffer_eth_impl;
+    IRingBuffer<CleanData>& buffer_sol = buffer_sol_impl;
 
     // 3개의 NRT 래치 (Processor -> Publisher)
     NrtLatch<MergedOrderBook> latch_btc;
@@ -377,7 +496,7 @@ int main() {
     set_thread_affinity(processor_sol, 5);
 
     // 30초간 실행
-    this_thread::sleep_for(chrono::seconds(70));
+    this_thread::sleep_for(chrono::seconds(150));
 
     {
         // Reader가 완전히 잠들도록 락 설정

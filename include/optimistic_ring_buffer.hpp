@@ -4,14 +4,9 @@
 #include <atomic>
 #include <stdexcept>
 #include <thread> // atomic_thread_fence
+#include "iring_buffer.hpp"
 
 using namespace std;
-
-enum class ReadResult {
-    Success,
-    NotReady,    // Writer가 아직 안 씀 (기다려야 함)
-    Overwritten  // Writer가 한 바퀴 이상 돎 (데이터 유실 -> 점프해야 함)
-};
 
 template <typename T>
 struct alignas(64) Aligned {
@@ -20,7 +15,7 @@ struct alignas(64) Aligned {
 
 // NRT MPSC Lock-Free Ring Buffer (LMAX Style + Seqlock)
 template<typename T>
-class OptimisticRingBuffer {
+class OptimisticRingBuffer : public IRingBuffer<T> {
 private:
     struct Entry {
         atomic<uint64_t> version;
